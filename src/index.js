@@ -1,13 +1,12 @@
 import express from 'express';
 import cors from 'cors';
-import fetch from 'node-fetch';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // MiniMax API 配置
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
@@ -49,14 +48,6 @@ const EXPERT_SYSTEM_PROMPT = `你是英镑汇率预测与兑换策略专家，�
 - 警报阈值设置
 - 合规提醒
 
-### 5. 📈 策略可视化
-使用Mermaid语法绘制时间线或概率分布图
-
-## 交互流程
-1. 询问用户：换汇用途、时间节点、涉及金额、风险偏好
-2. 基于实时数据生成个性化策略
-3. 设置汇率监控阈值
-
 免责声明：分析结果基于学术模型与宏观数据，仅供参考，不构成Financial Advice。`;
 
 // 主页
@@ -64,7 +55,8 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'GBP Exchange Expert API',
-    version: '1.0.0',
+    version: '1.1.0',
+    apiKeyConfigured: !!MINIMAX_API_KEY,
     endpoints: {
       chat: 'POST /api/chat - 发送消息获取分析',
       rate: 'GET /api/rate - 获取当前汇率',
@@ -75,17 +67,25 @@ app.get('/', (req, res) => {
 
 // 健康检查
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'healthy',
+    apiKeyConfigured: !!MINIMAX_API_KEY,
+    timestamp: new Date().toISOString()
+  });
 });
 
-// 获取当前汇率（简化版）
+// 获取当前汇率
 app.get('/api/rate', async (req, res) => {
   try {
-    // 调用汇率API（使用exchangerate-api免费接口）
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
     const response = await fetch(
       'https://api.exchangerate-api.com/v4/latest/GBP',
-      { timeout: 5000 }
+      { signal: controller.signal }
     );
+    clearTimeout(timeout);
+
     const data = await response.json();
 
     res.json({
@@ -96,19 +96,18 @@ app.get('/api/rate', async (req, res) => {
       source: 'exchangerate-api'
     });
   } catch (error) {
-    // 备用数据
     res.json({
       gbpCny: 9.2285,
       gbpUsd: 1.2695,
       usdCny: 6.9056,
       date: new Date().toISOString(),
       source: 'fallback',
-      note: 'Real-time API unavailable, using cached data'
+      note: 'Real-time API unavailable'
     });
   }
 });
 
-// 核心聊天接口 - 调用MiniMax Agent
+// 核心聊天接口
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, history = [] } = req.body;
@@ -117,52 +116,76 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: '消息内容不能为空' });
     }
 
-    // 构建消息历史
-    const messages = [
-      { role: 'system', role_type: 'system', content: EXPERT_SYSTEM_PROMPT },
-      ...history.map(h => ({
-        role: h.role,
-        role_type: h.role,
-        content: h.content
-      })),
-      { role: 'user', role_type: 'user', content: message }
-    ];
-
-    console.log('Calling MiniMax API with message:', message.substring(0, 100));
-
-    // 调用MiniMax API
-    const response = await fetch(MINIMAX_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${MINIMAX_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: 'MiniMax-Text-01',
-        messages: messages,
-        temperature: 0.7,
-        max_tokens: 4000
-      }),
-      timeout: 60000 // 60秒超时
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('MiniMax API Error:', response.status, errorText);
-      throw new Error(`MiniMax API调用失败: ${response.status}`);
+    // 检查API Key
+    if (!MINIMAX_API_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: 'MINIMAX_API_KEY未配置，请联系管理员'
+      });
     }
 
-    const data = await response.json();
-    const assistantMessage = data.choices?.[0]?.message?.content ||
-                            data.choices?.[0]?.text ||
-                            '抱歉，暂时无法生成回复，请稍后重试。';
+    // 构建消息
+    const messages = [
+      { role: 'system', content: EXPERT_SYSTEM_PROMPT },
+      ...history.map(h => ({
+        role: h.role,
+        content: h.content
+      })),
+      { role: 'user', content: message }
+    ];
 
-    res.json({
-      success: true,
-      message: assistantMessage,
-      usage: data.usage,
-      timestamp: new Date().toISOString()
-    });
+    // 调用MiniMax API，设置10秒超时
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      const response = await fetch(MINIMAX_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${MINIMAX_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: 'MiniMax-Text-01',
+          messages: messages,
+          temperature: 0.7,
+          max_tokens: 2000
+        }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('MiniMax API Error:', response.status, errorText);
+        throw new Error(`MiniMax API调用失败: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const assistantMessage = data.choices?.[0]?.message?.content ||
+                              data.choices?.[0]?.text ||
+                              '抱歉，暂时无法生成回复，请稍后重试。';
+
+      res.json({
+        success: true,
+        message: assistantMessage,
+        usage: data.usage,
+        timestamp: new Date().toISOString()
+      });
+    } catch (fetchError) {
+      clearTimeout(timeout);
+
+      // 检查是否是超时
+      if (fetchError.name === 'AbortError') {
+        return res.status(504).json({
+          success: false,
+          error: '请求超时，请稍后重试',
+          timestamp: new Date().toISOString()
+        });
+      }
+      throw fetchError;
+    }
 
   } catch (error) {
     console.error('Chat API Error:', error);
@@ -174,21 +197,11 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// 启动服务器
-app.listen(PORT, () => {
-  console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║   🚀 GBP Exchange Expert Backend Service                      ║
-║                                                               ║
-║   Server running on http://localhost:${PORT}                    ║
-║                                                               ║
-║   Endpoints:                                                  ║
-║   • GET  /            - Service info                         ║
-║   • GET  /api/health  - Health check                          ║
-║   • GET  /api/rate    - Current exchange rate                 ║
-║   • POST /api/chat    - Chat with GBP expert                  ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
-  `);
-});
+// 启动服务器（仅用于本地开发）
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`GBP Exchange Expert Backend running on http://localhost:${PORT}`);
+  });
+}
+
+export default app;
